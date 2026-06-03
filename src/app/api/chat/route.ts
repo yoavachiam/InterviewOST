@@ -65,25 +65,38 @@ export async function POST(req: Request) {
       return new Response("Interview is not active", { status: 403 });
     }
 
-    if (!isStart) {
-      const { error: userMsgError } = await supabase
-        .from("messages")
-        .insert({
-          interview_id: interviewId,
-          role: "user",
-          content: message,
-        });
-      if (userMsgError) {
-        console.error("Failed to save user message:", userMsgError);
-        return new Response("Failed to save message", { status: 500 });
-      }
-    }
-
+    // Fetch existing conversation history. We do this BEFORE the
+    // user-message insert so:
+    //   1. The prompt builder gets pre-insert history; the current user
+    //      message is added separately by buildTurnPrompt (avoids
+    //      double-quoting it in the prompt).
+    //   2. The LLM call can start while the user-insert is still in
+    //      flight on Supabase — saving ~100-300ms per turn.
     const { data: history } = await supabase
       .from("messages")
       .select("role, content")
       .eq("interview_id", interviewId)
       .order("created_at", { ascending: true });
+
+    // Fire-and-forget the user-message insert. We await it before writing
+    // the assistant message (below, in the stream pump) so DB ordering is
+    // preserved. If the insert fails, we log and continue — the current
+    // turn already has the text in the prompt, so the agent responds
+    // correctly; the loss is only that this user message is missing from
+    // future turns' history.
+    const userInsertPromise: PromiseLike<unknown> = isStart
+      ? Promise.resolve(null)
+      : supabase
+          .from("messages")
+          .insert({
+            interview_id: interviewId,
+            role: "user",
+            content: message,
+          })
+          .then(({ error }) => {
+            if (error) console.error("Failed to save user message:", error);
+            return error;
+          });
 
     const interviewer = mastra.getAgent("interviewerAgent");
     const systemContext = buildSystemContext(
@@ -124,6 +137,9 @@ export async function POST(req: Request) {
           const raw = cleaner.getRaw();
           if (raw.trim()) {
             const { cleaned, complete } = cleanForStorage(raw);
+            // Make sure the user message lands first so the messages
+            // table stays in natural user→assistant order.
+            await userInsertPromise;
             const { error: assistantMsgError } = await supabase
               .from("messages")
               .insert({
